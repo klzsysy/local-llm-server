@@ -1,0 +1,16 @@
+[Unit]
+Description=Fan Controller Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/fan-control.sh
+Restart=on-failure
+RestartSec=5s
+# StartLimitInterval=0
+StartLimitInterval=1m
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target
