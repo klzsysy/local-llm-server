@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "local-llm-server",
+  "name": "llm-api-benchmark",
   "compatibility_date": "2026-04-30",
   "observability": {
     "enabled": true
