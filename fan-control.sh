@@ -2,6 +2,7 @@
 
 set -eo pipefail
 
+: ${IPMI_DEVICE:=/dev/ipmi0}
 : ${IPMI_HOST:="169.254.3.254"}
 : ${IPMI_USER:=}
 : ${IPMI_PASS:=}
@@ -12,6 +13,7 @@ set -eo pipefail
 export PATH
 
 readonly version=v1.0.0
+ipmi_lan_args="-I lanplus -H "$IPMI_HOST" -U "$IPMI_USER" -P "$IPMI_PASS""
 
 declare -gA GPU_LEVEL_CODE=(
           ["1"]="0x10"   ["2"]="0x28"
@@ -51,33 +53,42 @@ function req_check() {
 
 req_check ipmitool sensors nvidia-smi
 
-if [ -z "${IPMI_USER}" ] || [ -z "${IPMI_PASS}" ] || [ -z "${IPMI_HOST}" ];then
-    echo "Valid IPMI information must be specified" >&2
+if [ -n "${IPMI_DEVICE}" ];then
+    if [ -e "${IPMI_DEVICE}" ];then
+        log "Use ipmi device ${IPMI_DEVICE}"
+        ipmi_lan_args=""
+    else
+        log "ipmi device not exist ${IPMI_DEVICE}" >&2
+        exit 1
+    fi
+elif [ -z "${IPMI_USER}" ] || [ -z "${IPMI_PASS}" ] || [ -z "${IPMI_HOST}" ];then
+    log "Remote LAN IPMI information must be specified" >&2
     exit 1
 fi
 
-
-until ping -c 2 "${IPMI_HOST}"
-do
-    log "waiting ipmi host network ready"
-    sleep 2
-done
+if [ -n "$ipmi_lan_args" ];then
+    until ping -c 2 "${IPMI_HOST}"
+    do
+        log "Waiting ipmi host network ready"
+        sleep 2
+    done
+fi
 
 log "Boot fan control: $version"
 # 将风扇控制模式设置为手动（Full Speed Mode）
 log "Set fan control to manual mode"
-ipmitool -I lanplus -H "$IPMI_HOST" -U "$IPMI_USER" -P "$IPMI_PASS" raw 0x30 0x45 0x01 0x01
+ipmitool ${ipmi_lan_args} raw 0x30 0x45 0x01 0x01
 
-log "wait 20s..."
+log "Waiting 20s"
 sleep 20
 
 # 设置初始风扇速度 设置为最低
 # GPU 最低有效值 560/2500 22%
 log "Set GPU fun init speed 560/2500 22%"
-ipmitool -I lanplus -H "$IPMI_HOST" -U "$IPMI_USER" -P "$IPMI_PASS" raw 0x30 0x70 0x66 0x01 0x00 0x10
+ipmitool ${ipmi_lan_args} raw 0x30 0x70 0x66 0x01 0x00 0x10
 # CPU 最低有效值 980/2100 46%
 log "Set CPU fun init speed 980/2100 26%"
-ipmitool -I lanplus -H "$IPMI_HOST" -U "$IPMI_USER" -P "$IPMI_PASS" raw 0x30 0x70 0x66 0x01 0x01 0x19
+ipmitool ${ipmi_lan_args} raw 0x30 0x70 0x66 0x01 0x01 0x19
 
 
 sleep 4
@@ -99,7 +110,7 @@ function set_gpu_fan(){
     local level=$3
     log "GPU temperature $temp, Set GPU fan speed to $percentage"
 
-    ipmitool -I lanplus -H "$IPMI_HOST" -U "$IPMI_USER" -P "$IPMI_PASS" raw 0x30 0x70 0x66 0x01 0x00 ${GPU_LEVEL_CODE[$level]}
+    ipmitool ${ipmi_lan_args} raw 0x30 0x70 0x66 0x01 0x00 ${GPU_LEVEL_CODE[$level]}
     CUR_GPU_FAN_SPEED_LEVEL=$level
     GPU_DECELERATION_DELAY_COUNT=0
 }
@@ -109,7 +120,7 @@ function set_cpu_fan(){
     local percentage=$2
     local level=$3
     log "CPU temperature $temp, Set CPU fan speed to $percentage"
-    ipmitool -I lanplus -H "$IPMI_HOST" -U "$IPMI_USER" -P "$IPMI_PASS" raw 0x30 0x70 0x66 0x01 0x01 ${CPU_LEVEL_CODE[$level]}
+    ipmitool ${ipmi_lan_args} raw 0x30 0x70 0x66 0x01 0x01 ${CPU_LEVEL_CODE[$level]}
     CUR_CPU_FAN_SPEED_LEVEL=$level
     CPU_DECELERATION_DELAY_COUNT=0
 }
