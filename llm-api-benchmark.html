@@ -2766,6 +2766,23 @@
       };
 
       const els = {};
+      const CAPABILITY_SIGNATURE_FIELD_IDS = new Set([
+        "base-url",
+        "completion-endpoint",
+        "models-endpoint",
+        "api-key",
+        "extra-headers",
+        "manual-model",
+        "endpoint-profile"
+      ]);
+      const MODEL_AUTO_LOAD_FIELD_IDS = new Set([
+        "base-url",
+        "models-endpoint",
+        "api-key",
+        "extra-headers",
+        "auto-load-models",
+        "endpoint-profile"
+      ]);
 
       document.addEventListener("DOMContentLoaded", init);
 
@@ -2879,7 +2896,8 @@
         }
       }
 
-      function handleSettingsMutation() {
+      function handleSettingsMutation(event) {
+        const sourceId = event?.target?.id || "";
         syncPresetControl("max-tokens-preset", els["max-tokens"].value, MAX_TOKEN_PRESETS);
         syncPresetControl("target-output-preset", els["target-output"].value, TARGET_OUTPUT_PRESETS);
         syncEndpointProfileFromEndpoints();
@@ -2891,8 +2909,12 @@
         renderHardwareSummary();
         renderReasoningStatus();
         renderEnvironmentHint();
-        maybeResetCapabilitiesForConnectionChange();
-        maybeAutoLoadModels(false);
+        if (CAPABILITY_SIGNATURE_FIELD_IDS.has(sourceId)) {
+          maybeResetCapabilitiesForConnectionChange();
+        }
+        if (MODEL_AUTO_LOAD_FIELD_IDS.has(sourceId)) {
+          maybeAutoLoadModels(false);
+        }
       }
 
       function loadSettings() {
@@ -3071,7 +3093,7 @@
           els["completion-endpoint"].value = "/api/chat";
           els["models-endpoint"].value = "/api/tags";
         }
-        handleSettingsMutation();
+        handleSettingsMutation({ target: els["endpoint-profile"] });
       }
 
       function syncEndpointProfileFromEndpoints() {
@@ -3683,7 +3705,11 @@
         els["theme-toggle"].title = t("themeToggleTitle", { mode: modeLabel });
       }
 
-      function detectHardwareInfo(forceOverwrite) {
+      async function detectHardwareInfo(forceOverwrite) {
+        if (forceOverwrite) {
+          await refreshServerFrameworkHintForHardwareDetect();
+        }
+
         const detected = getDetectedHardwareInfo();
         fillHardwareField("system-info", detected.systemInfo, forceOverwrite);
         fillHardwareField("cpu-info", detected.cpuInfo, forceOverwrite);
@@ -3700,6 +3726,17 @@
         renderHardwareSummary();
         renderReasoningStatus();
         saveSettings();
+      }
+
+      async function refreshServerFrameworkHintForHardwareDetect() {
+        if (state.isRunning || !els["base-url"]?.value.trim()) {
+          return;
+        }
+        try {
+          await detectServerCapabilities(true);
+        } catch (error) {
+          // Capability probing owns its UI error state; hardware detection should still continue.
+        }
       }
 
       function fillHardwareField(id, value, forceOverwrite) {
@@ -3962,6 +3999,18 @@
         if (source.includes("ollama")) {
           return "Ollama";
         }
+        if (source.includes("text-generation-inference") || source.includes("tgi")) {
+          return "TGI";
+        }
+        if (source.includes("lmdeploy")) {
+          return "LMDeploy";
+        }
+        if (source.includes("tensorrt")) {
+          return "TensorRT-LLM";
+        }
+        if (source.includes("llama.cpp")) {
+          return "llama.cpp";
+        }
         return "";
       }
 
@@ -4026,6 +4075,9 @@
           if (framework === "SGLang" || !framework) {
             followupTasks.sglangServerInfo = probeJsonEndpoint(settings, "/get_server_info");
             followupTasks.sglangModelInfo = probeJsonEndpoint(settings, "/get_model_info");
+            if (shouldProbeRoute(routes, "/v1/loads")) {
+              followupTasks.sglangLoadsMetrics = probeTextEndpoint(settings, "/v1/loads?format=prometheus");
+            }
           }
 
           if (framework === "Ollama" || (!framework && isOllamaProfile)) {
@@ -4215,6 +4267,7 @@
 	        const sglangModelInfo = probes.sglangModelInfo;
 	        const ollamaVersion = probes.ollamaVersion;
 	        const metrics = probes.metrics;
+	        const sglangLoadsMetrics = probes.sglangLoadsMetrics;
 	        const tokenize = probes.tokenize;
 	        const render = probes.render;
 	        const messagesCountTokens = probes.messagesCountTokens;
@@ -4281,6 +4334,7 @@
 
         if (metrics?.ok) {
 	          mark("metrics", true);
+	          mark("prometheusMetrics", true);
 	          addFeature("metrics");
 	          const metricsInfo = parseMetricsCapabilities(metrics.text);
 	          Object.assign(capabilities, metricsInfo.capabilities);
@@ -4291,7 +4345,26 @@
 	            result.framework = metricsInfo.framework;
 	          }
         } else {
-          addProbeError("/metrics", metrics);
+          addProbeError("/metrics", metrics, { ignoreStatuses: sglangLoadsMetrics?.ok ? [404] : [] });
+        }
+
+        if (sglangLoadsMetrics?.ok) {
+          mark("metrics", true);
+          mark("sglangLoadsMetrics", true);
+          addFeature("SGLang load metrics");
+          const metricsInfo = parseMetricsCapabilities(sglangLoadsMetrics.text);
+          Object.assign(capabilities, metricsInfo.capabilities);
+          result.metricsSnapshot = {
+            ...(result.metricsSnapshot || {}),
+            ...(metricsInfo.snapshot || {})
+          };
+          metricsInfo.features.forEach(addFeature);
+          metricsInfo.notes.forEach((item) => notes.push(item));
+          if (metricsInfo.framework) {
+            result.framework = metricsInfo.framework;
+          }
+        } else {
+          addProbeError("/v1/loads", sglangLoadsMetrics, { ignoreStatuses: [404, 405] });
         }
 
         if (tokenize?.ok && extractTokenCountFromPayload(tokenize.payload) != null) {
@@ -4420,7 +4493,7 @@
 	          result.framework = "vLLM";
 	          result.capabilities.vllmMetrics = true;
 	        }
-        if (source.includes("sglang:")) {
+        if (source.includes("sglang:") || source.includes("sglang_")) {
           result.framework = "SGLang";
           result.capabilities.sglangMetrics = true;
           addFeature("SGLang metrics");
@@ -4438,7 +4511,7 @@
           result.capabilities.prefixCacheMetrics = true;
           addFeature("prefix cache");
         }
-        if (/sglang:(prefix_cache|radix_cache|cache_hit_rate)/i.test(source)) {
+        if (/sglang[:_](prefix_cache|radix_cache|cache_hit_rate)/i.test(source)) {
           result.capabilities.prefixCacheMetrics = true;
           addFeature("prefix cache");
         }
@@ -4457,15 +4530,15 @@
           result.capabilities.queueMetrics = true;
           addFeature("queue metrics");
         }
-        if (/sglang:(num_queue_reqs|num_running_reqs|num_used_tokens|token_usage)/.test(source)) {
+        if (/sglang[:_](num_queue_reqs|num_waiting_reqs|num_running_reqs|num_used_tokens|token_usage|queues_waiting)/.test(source)) {
           result.capabilities.queueMetrics = true;
           addFeature("queue metrics");
         }
 	        const snapshot = result.snapshot;
-	        snapshot.runningRequests = extractPrometheusLatestValue(source, ["vllm:num_requests_running", "sglang:num_running_reqs"]);
-	        snapshot.waitingRequests = extractPrometheusLatestValue(source, ["vllm:num_requests_waiting", "sglang:num_queue_reqs", "sglang:num_waiting_reqs"]);
-	        snapshot.kvCacheUsage = extractPrometheusLatestValue(source, ["vllm:gpu_cache_usage_perc", "vllm:kv_cache_usage_perc", "sglang:token_usage", "sglang:kv_cache_usage_perc"]);
-	        snapshot.prefixCacheHitRate = extractPrometheusLatestValue(source, ["vllm:prefix_cache_hit_rate", "vllm:prefix_cache_hits_rate", "sglang:cache_hit_rate"]);
+	        snapshot.runningRequests = extractPrometheusLatestValue(source, ["vllm:num_requests_running", "sglang:num_running_reqs", "sglang_num_running_reqs"]);
+	        snapshot.waitingRequests = extractPrometheusLatestValue(source, ["vllm:num_requests_waiting", "sglang:num_queue_reqs", "sglang:num_waiting_reqs", "sglang_num_waiting_reqs", "sglang_queues_waiting"]);
+	        snapshot.kvCacheUsage = extractPrometheusLatestValue(source, ["vllm:gpu_cache_usage_perc", "vllm:kv_cache_usage_perc", "sglang:token_usage", "sglang:kv_cache_usage_perc", "sglang_token_usage"]);
+	        snapshot.prefixCacheHitRate = extractPrometheusLatestValue(source, ["vllm:prefix_cache_hit_rate", "vllm:prefix_cache_hits_rate", "sglang:cache_hit_rate", "sglang_cache_hit_rate"]);
 	        snapshot.prefixCacheQueries = extractPrometheusSumValue(source, ["vllm:prefix_cache_queries_total", "vllm:external_prefix_cache_queries_total"]);
 	        snapshot.prefixCacheHits = extractPrometheusSumValue(source, ["vllm:prefix_cache_hits_total", "vllm:external_prefix_cache_hits_total"]);
 	        if (snapshot.prefixCacheHits == null) {
@@ -4474,16 +4547,17 @@
 	        if (snapshot.prefixCacheHitRate == null && snapshot.prefixCacheQueries > 0) {
 	          snapshot.prefixCacheHitRate = (snapshot.prefixCacheHits || 0) / snapshot.prefixCacheQueries;
 	        }
-	        snapshot.promptTokenTotal = extractPrometheusSumValue(source, ["vllm:prompt_tokens_total", "sglang:prompt_tokens_total"]);
+	        snapshot.promptTokenTotal = extractPrometheusSumValue(source, ["vllm:prompt_tokens_total", "sglang:prompt_tokens_total", "sglang_prompt_tokens_total"]);
 	        if (snapshot.promptTokenTotal == null) {
 	          snapshot.promptTokenTotal = extractPrometheusSumValue(source, ["vllm:prompt_tokens_by_source_total"]);
 	        }
-	        snapshot.generationTokenTotal = extractPrometheusSumValue(source, ["vllm:generation_tokens_total", "sglang:generation_tokens_total"]);
+	        snapshot.generationTokenTotal = extractPrometheusSumValue(source, ["vllm:generation_tokens_total", "sglang:generation_tokens_total", "sglang_generation_tokens_total"]);
 	        if (snapshot.generationTokenTotal == null) {
 	          snapshot.generationTokenTotal = extractPrometheusSumValue(source, ["vllm:generation_tokens_by_source_total"]);
 	        }
-	        snapshot.requestSuccessTotal = extractPrometheusSumValue(source, ["vllm:request_success_total", "sglang:request_success_total"]);
-	        const serverTtftP95Seconds = extractPrometheusHistogramQuantile(source, ["vllm:time_to_first_token_seconds", "sglang:time_to_first_token_seconds"], 0.95);
+	        snapshot.generationTokenRate = extractPrometheusLatestValue(source, ["sglang_gen_throughput"]) ?? snapshot.generationTokenRate;
+	        snapshot.requestSuccessTotal = extractPrometheusSumValue(source, ["vllm:request_success_total", "sglang:request_success_total", "sglang_request_success_total"]);
+	        const serverTtftP95Seconds = extractPrometheusHistogramQuantile(source, ["vllm:time_to_first_token_seconds", "sglang:time_to_first_token_seconds", "sglang_time_to_first_token_seconds"], 0.95);
 	        if (serverTtftP95Seconds != null) {
 	          snapshot.serverTtftP95Ms = serverTtftP95Seconds * 1000;
 	        }
@@ -4492,12 +4566,14 @@
 	        if (snapshot.specDraftTokens > 0) {
 	          snapshot.specAcceptanceRate = (snapshot.specAcceptedTokens || 0) / snapshot.specDraftTokens;
 	        }
+	        snapshot.specAcceptanceRate = extractPrometheusLatestValue(source, ["sglang_spec_accept_rate"]) ?? snapshot.specAcceptanceRate;
+	        snapshot.specAcceptLength = extractPrometheusLatestValue(source, ["sglang_spec_accept_length"]) ?? snapshot.specAcceptLength;
 
 	        if (/vllm:(gpu_cache_usage_perc|kv_cache_usage_perc)/.test(source)) {
 	          result.capabilities.kvCacheMetrics = true;
 	          addFeature("KV cache metrics");
 	        }
-        if (/sglang:(cache_hit_rate|prefix_cache|radix_cache|kv_cache)/i.test(source)) {
+        if (/sglang[:_](cache_hit_rate|prefix_cache|radix_cache|kv_cache|token_usage)/i.test(source)) {
           result.capabilities.kvCacheMetrics = true;
           addFeature("KV cache metrics");
         }
@@ -4942,9 +5018,15 @@
         }
 
         const previous = String(state.frameworkHint || "").trim();
+        const previousFramework = normalizeFrameworkName(previous);
+        const candidateFramework = normalizeFrameworkName(candidate);
+        const currentFieldValue = String(els["framework-info"]?.value || "").trim();
+        const currentFieldFramework = normalizeFrameworkName(currentFieldValue);
         let finalHint = previous;
 
         if (!previous) {
+          finalHint = candidate;
+        } else if (previousFramework && candidateFramework && previousFramework !== candidateFramework) {
           finalHint = candidate;
         } else if (candidate.toLowerCase().startsWith(previous.toLowerCase()) && candidate.length > previous.length) {
           finalHint = candidate;
@@ -4956,8 +5038,21 @@
           return;
         }
 
+        const shouldUpdateFrameworkField = !currentFieldValue
+          || currentFieldValue === previous
+          || (
+            previousFramework
+            && candidateFramework
+            && previousFramework !== candidateFramework
+            && currentFieldFramework === previousFramework
+          );
+
         state.frameworkHint = finalHint;
-        applyFrameworkHintIfEmpty();
+        if (shouldUpdateFrameworkField && els["framework-info"]) {
+          els["framework-info"].value = finalHint;
+        } else {
+          applyFrameworkHintIfEmpty();
+        }
         renderHardwareSummary();
         renderReasoningStatus();
         saveSettings();
@@ -5999,10 +6094,16 @@
 	      }
 
       async function sampleServerMetrics(settings) {
-	        if (!state.capabilityProbe?.capabilities?.metrics) {
+	        const capabilities = state.capabilityProbe?.capabilities || {};
+	        if (!capabilities.metrics && !capabilities.sglangLoadsMetrics) {
 	          return null;
 	        }
-	        const probe = await probeTextEndpoint(settings, "/metrics");
+	        const endpoint = capabilities.prometheusMetrics
+	          ? "/metrics"
+	          : capabilities.sglangLoadsMetrics
+	            ? "/v1/loads?format=prometheus"
+	            : "/metrics";
+	        const probe = await probeTextEndpoint(settings, endpoint);
 	        if (!probe.ok) {
 	          return null;
 	        }
@@ -6042,8 +6143,14 @@
 	          }
 	          return (current - previous) / elapsedSeconds;
 	        };
-	        snapshot.promptTokenRate = counterRate("promptTokenTotal");
-	        snapshot.generationTokenRate = counterRate("generationTokenTotal");
+	        const promptTokenRate = counterRate("promptTokenTotal");
+	        const generationTokenRate = counterRate("generationTokenTotal");
+	        if (promptTokenRate != null) {
+	          snapshot.promptTokenRate = promptTokenRate;
+	        }
+	        if (generationTokenRate != null) {
+	          snapshot.generationTokenRate = generationTokenRate;
+	        }
 	        return snapshot;
 	      }
 
